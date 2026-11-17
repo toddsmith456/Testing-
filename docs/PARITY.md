@@ -26,6 +26,7 @@ Do not label a button or screen 'complete' until source-based behavior, error/of
 
 - 21 automated Rust tests pass, including account isolation, migrations, reply tags, an in-process mock relay and mock NIP-46 signer. They do not replace real signer/relay interoperability or Android device testing.
 - ARM64 development APK cross-compiles and its signature and 16 KB native library alignment verify. It is debug-signed and is **not** a production release.
+- A user reported that the v0.1.0-dev.2 APK would not install on Android 17 ARM64. That native-only APK did not declare `android:hasCode="false"`; a subsequent manifest fix is built and verified structurally, but still requires device installation/launch testing.
 - An attempted Android emulator could not complete startup in this environment: there is no hardware virtualization and the available memory is insufficient. No Android UI, soft keyboard, installation or lifecycle behavior was verified.
 - Remaining release blockers include Android real-device tests (especially text input and TalkBack in NativeActivity), real remote signer and relay tests, resilient network/error handling, security and dependency review, privacy review, user-controlled production signing, and the substantial missing parity features above. No release tag should be advertised as a complete clone before these gates pass.
 

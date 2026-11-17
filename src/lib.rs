@@ -18,3 +18,16 @@ fn android_main(app: android_activity::AndroidApp) {
         Box::new(move |cc| Ok(Box::new(ui::NosturApp::new(cc, data_dir.clone())))),
     );
 }
+
+#[cfg(test)]
+mod android_packaging_tests {
+    #[test]
+    fn native_activity_manifest_declares_no_dex_code() {
+        let manifest = include_str!("../android/AndroidManifest.xml");
+        assert!(
+            manifest.contains("android:hasCode=\"false\""),
+            "NativeActivity APK without DEX must declare hasCode=false"
+        );
+        assert!(manifest.contains("android.app.NativeActivity"));
+    }
+}

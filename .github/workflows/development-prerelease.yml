@@ -46,6 +46,8 @@ jobs:
 
           ARM64 Android development APK, signed with an automatically generated debug key. The key is ephemeral: future APKs will generally not update this installation in place. Installing a differently signed build may require uninstalling this one and losing its local data. Do not use with sensitive accounts or as the sole copy of data.
 
+          This build corrects the previous APK manifest: it now declares that the native-only app contains no DEX code. Actual Android device installation and launch have not yet been verified.
+
           Features include offline public-account switching, local-only mutes, local public-event cache and bookmarks, and experimental public notes and NIP-10 replies through a NIP-46 remote signer. Signing and publication are separate actions. Relay operators can see IP addresses and request metadata; mutes are not published or synced. No automatic remote media, analytics or advertising is intentionally included.
 
           Host tests and build/signature checks are automated, but this build has not been tested on an Android device, with real signers, or with public relays, and has not received an independent security, privacy or dependency audit. DMs, notifications, payments, media and substantial Nostur functionality are missing. See README.md and docs/PARITY.md for limitations.

@@ -37,4 +37,13 @@ else
   "$BT/apksigner" sign --ks "$ANDROID_KEYSTORE" --ks-key-alias "$ANDROID_KEY_ALIAS" --ks-pass env:ANDROID_STORE_PASS --key-pass env:ANDROID_KEY_PASS --out "$OUT/nostur-rust-release.apk" "$OUT/aligned.apk"
 fi
 "$BT/apksigner" verify --verbose "$OUT/nostur-rust-$MODE.apk"
+# This APK has native code only. If it declares DEX code, Android can reject installation.
+MANIFEST_XML=$("$BT/aapt" dump xmltree "$OUT/nostur-rust-$MODE.apk" AndroidManifest.xml)
+if ! grep -Eq 'android:hasCode.*0x0' <<<"$MANIFEST_XML"; then
+  echo "ERROR: packaged manifest does not declare android:hasCode=false" >&2; exit 1
+fi
+APK_ENTRIES=$(unzip -Z1 "$OUT/nostur-rust-$MODE.apk")
+if grep -Eq '(^|/)classes([0-9]+)?\.dex$' <<<"$APK_ENTRIES"; then
+  echo "ERROR: APK contains DEX but manifest declares no DEX code" >&2; exit 1
+fi
 echo "APK: $OUT/nostur-rust-$MODE.apk"
