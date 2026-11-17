@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a developer-only ARM64 NativeActivity APK. No Gradle, Java or Kotlin app code.
+# Build an Android NativeActivity APK. Release builds require user-controlled signing material.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 : "${ANDROID_HOME:?Set ANDROID_HOME to your Android SDK directory}"
@@ -7,19 +7,32 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 : "${JAVA_HOME:?Set JAVA_HOME to a JDK directory}"
 BT="$ANDROID_HOME/build-tools/35.0.0"
 TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOL/aarch64-linux-android24-clang"
-export CC_aarch64_linux_android="$TOOL/aarch64-linux-android24-clang"
-export AR_aarch64_linux_android="$TOOL/llvm-ar"
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-C link-arg=-Wl,-z,max-page-size=16384'
+ABI="${ANDROID_ABI:-arm64-v8a}"
+case "$ABI" in
+  arm64-v8a) TARGET=aarch64-linux-android; export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOL/aarch64-linux-android24-clang" CC_aarch64_linux_android="$TOOL/aarch64-linux-android24-clang" AR_aarch64_linux_android="$TOOL/llvm-ar" CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS='-C link-arg=-Wl,-z,max-page-size=16384' ;;
+  x86_64) TARGET=x86_64-linux-android; export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOL/x86_64-linux-android24-clang" CC_x86_64_linux_android="$TOOL/x86_64-linux-android24-clang" AR_x86_64_linux_android="$TOOL/llvm-ar" CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS='-C link-arg=-Wl,-z,max-page-size=16384' ;;
+  *) echo "Unsupported ANDROID_ABI: $ABI" >&2; exit 1 ;;
+esac
+MODE="${ANDROID_BUILD_MODE:-debug}"
+case "$MODE" in debug) BUILD_FLAGS=();; release)
+  : "${ANDROID_KEYSTORE:?Set ANDROID_KEYSTORE to your release keystore}"
+  : "${ANDROID_KEY_ALIAS:?Set ANDROID_KEY_ALIAS to your release signing alias}"
+  : "${ANDROID_STORE_PASS:?Set ANDROID_STORE_PASS securely in the environment}"
+  : "${ANDROID_KEY_PASS:?Set ANDROID_KEY_PASS securely in the environment}"
+  BUILD_FLAGS=(--release);; *) echo "ANDROID_BUILD_MODE must be debug or release" >&2;exit 1;; esac
 cd "$ROOT"
-cargo build --locked --lib --target aarch64-linux-android
-OUT="$ROOT/target/android-apk"; rm -rf "$OUT"; mkdir -p "$OUT/lib/arm64-v8a" "$HOME/.android"
-cp "$ROOT/target/aarch64-linux-android/debug/libnostur_rust.so" "$OUT/lib/arm64-v8a/"
+cargo build --locked --lib --target "$TARGET" "${BUILD_FLAGS[@]}"
+OUT="$ROOT/target/android-apk-$ABI-$MODE"; rm -rf "$OUT"; mkdir -p "$OUT/lib/$ABI" "$HOME/.android"
+cp "$ROOT/target/$TARGET/$MODE/libnostur_rust.so" "$OUT/lib/$ABI/"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$ANDROID_HOME/platforms/android-35/android.jar" --manifest "$ROOT/android/AndroidManifest.xml" --min-sdk-version 24 --target-sdk-version 35
-(cd "$OUT" && zip -q -0 base.apk lib/arm64-v8a/libnostur_rust.so)
+(cd "$OUT" && zip -q -0 base.apk "lib/$ABI/libnostur_rust.so")
 "$BT/zipalign" -P 16 -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
-KEYSTORE="$HOME/.android/nostur-rust-debug.keystore"
-if [[ ! -e "$KEYSTORE" ]]; then "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1; fi
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out "$OUT/nostur-rust-debug.apk" "$OUT/aligned.apk"
-"$BT/apksigner" verify --verbose "$OUT/nostur-rust-debug.apk"
-echo "APK: $OUT/nostur-rust-debug.apk"
+if [[ "$MODE" == debug ]]; then
+  KEYSTORE="$HOME/.android/nostur-rust-debug.keystore"
+  if [[ ! -e "$KEYSTORE" ]]; then "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000 >/dev/null 2>&1; fi
+  "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out "$OUT/nostur-rust-debug.apk" "$OUT/aligned.apk"
+else
+  "$BT/apksigner" sign --ks "$ANDROID_KEYSTORE" --ks-key-alias "$ANDROID_KEY_ALIAS" --ks-pass env:ANDROID_STORE_PASS --key-pass env:ANDROID_KEY_PASS --out "$OUT/nostur-rust-release.apk" "$OUT/aligned.apk"
+fi
+"$BT/apksigner" verify --verbose "$OUT/nostur-rust-$MODE.apk"
+echo "APK: $OUT/nostur-rust-$MODE.apk"

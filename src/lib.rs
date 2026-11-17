@@ -1,4 +1,5 @@
 pub mod core;
+pub mod publish;
 pub mod storage;
 pub mod ui;
 

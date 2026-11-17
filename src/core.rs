@@ -2,7 +2,10 @@
 use ::url::Url;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use thiserror::Error;
 
 const MAX_RELAYS: usize = 8;
@@ -31,9 +34,55 @@ pub struct Post {
     pub event_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Profile {
+    pub author: String,
+    pub name: String,
+    pub about: String,
+    pub created_at: u64,
+    pub event_id: String,
+    pub event_json: String,
+}
+
+/// Metadata is public but untrusted. Verify the event before presenting its text.
+pub fn profile_from_json(json: &str) -> Option<Profile> {
+    if json.len() > 160_000 {
+        return None;
+    }
+    let event = Event::from_json(json).ok()?;
+    if event.kind != Kind::Metadata || event.content.len() > 32_000 || event.verify().is_err() {
+        return None;
+    }
+    let data: serde_json::Value = serde_json::from_str(&event.content).ok()?;
+    let field = |name: &str, limit: usize| {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .take(limit)
+            .collect::<String>()
+    };
+    let display = field("display_name", 100);
+    let fallback = field("name", 100);
+    Some(Profile {
+        author: event.pubkey.to_hex(),
+        name: if display.is_empty() {
+            fallback
+        } else {
+            display
+        },
+        about: field("about", 1000),
+        created_at: event.created_at.as_secs(),
+        event_id: event.id.to_hex(),
+        event_json: json.to_owned(),
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct FeedResult {
     pub posts: Vec<Post>,
+    pub profiles: Vec<Profile>,
     pub follow_count: usize,
     pub follow_list_found: bool,
     pub truncated_follows: bool,
@@ -68,6 +117,22 @@ pub fn parse_relays(text: &str) -> Result<Vec<String>, FeedError> {
     Ok(urls.into_iter().collect())
 }
 
+/// Limits hostile input at the relay and buffered-result boundaries.
+pub fn relay_limits() -> RelayLimits {
+    let mut limits = RelayLimits::default();
+    limits.messages.max_size = Some(512 * 1024);
+    limits.events.max_size = Some(384 * 1024);
+    limits.events.max_num_tags = Some(2000);
+    limits
+        .events
+        .max_num_tags_per_kind
+        .insert(Kind::ContactList, Some(4000));
+    limits
+}
+pub fn bounded_client() -> Client {
+    Client::builder().relay_limits(relay_limits()).build()
+}
+
 /// Uses only the explicitly passed relays. A missing list is not treated as an empty authoritative list.
 /// An SDK result can still be partial if some relays fail; caller must tell the user.
 pub async fn fetch_following(
@@ -83,7 +148,7 @@ async fn fetch_following_inner(
     pubkey: PublicKey,
     relays: Vec<String>,
 ) -> Result<FeedResult, FeedError> {
-    let client = Client::default();
+    let client = bounded_client();
     for relay in &relays {
         client
             .add_relay(relay.as_str())
@@ -107,6 +172,7 @@ async fn fetch_following_inner(
         .limit(10);
     let lists = client
         .fetch_events(filter)
+        .max_events(80)
         .timeout(Duration::from_secs(8))
         .await
         .map_err(|e| FeedError::Network(e.to_string()))?;
@@ -122,6 +188,7 @@ async fn fetch_following_inner(
         client.disconnect().await;
         return Ok(FeedResult {
             posts: Vec::new(),
+            profiles: Vec::new(),
             follow_count: 0,
             follow_list_found: false,
             truncated_follows: false,
@@ -149,6 +216,7 @@ async fn fetch_following_inner(
         .limit(MAX_POSTS);
     let events = client
         .fetch_events(filter)
+        .max_events(1600)
         .timeout(Duration::from_secs(8))
         .await
         .map_err(|e| FeedError::Network(e.to_string()))?;
@@ -174,9 +242,49 @@ async fn fetch_following_inner(
             .then_with(|| a.id.cmp(&b.id))
     });
     posts.truncate(MAX_POSTS);
+    let profile_authors: Vec<PublicKey> = posts
+        .iter()
+        .filter_map(|p| PublicKey::parse(&p.author).ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut newest_profiles: BTreeMap<String, Profile> = BTreeMap::new();
+    if !profile_authors.is_empty() {
+        let filter = Filter::new()
+            .authors(profile_authors)
+            .kind(Kind::Metadata)
+            .limit(400);
+        if let Ok(events) = client
+            .fetch_events(filter)
+            .max_events(1000)
+            .timeout(Duration::from_secs(8))
+            .await
+        {
+            for event in events {
+                let Some(profile) = profile_from_json(&event.as_json()) else {
+                    continue;
+                };
+                if !allowed.contains(&event.pubkey) {
+                    continue;
+                }
+                let replace = match newest_profiles.get(&profile.author) {
+                    None => true,
+                    Some(old) => {
+                        profile.created_at > old.created_at
+                            || (profile.created_at == old.created_at
+                                && profile.event_id < old.event_id)
+                    }
+                };
+                if replace {
+                    newest_profiles.insert(profile.author.clone(), profile);
+                }
+            }
+        }
+    }
     client.disconnect().await;
     Ok(FeedResult {
         posts,
+        profiles: newest_profiles.into_values().collect(),
         follow_count,
         follow_list_found: true,
         truncated_follows,
@@ -248,7 +356,13 @@ mod tests {
         let unwanted = EventBuilder::new(Kind::TextNote, "A stranger's note")
             .finalize(&stranger)
             .unwrap();
-        for event in [&follows, &wanted, &unwanted] {
+        let metadata = EventBuilder::new(
+            Kind::Metadata,
+            r#"{"name":"Test author","about":"Public profile"}"#,
+        )
+        .finalize(&followed)
+        .unwrap();
+        for event in [&follows, &wanted, &unwanted, &metadata] {
             publisher.send_event(event).await.unwrap();
         }
         let result = fetch_following_inner(owner.public_key(), vec![url])
@@ -258,6 +372,8 @@ mod tests {
         assert_eq!(result.follow_count, 1);
         assert_eq!(result.posts.len(), 1);
         assert_eq!(result.posts[0].id, wanted.id.to_hex());
+        assert_eq!(result.profiles.len(), 1);
+        assert_eq!(result.profiles[0].name, "Test author");
         publisher.shutdown().await;
     }
 }
