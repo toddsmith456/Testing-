@@ -5,6 +5,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 : "${ANDROID_HOME:?Set ANDROID_HOME to your Android SDK directory}"
 : "${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to your Android NDK directory}"
 : "${JAVA_HOME:?Set JAVA_HOME to a JDK directory}"
+# Android SDK tools launch java from PATH; use the requested JDK consistently.
+export PATH="$JAVA_HOME/bin:$PATH"
 BT="$ANDROID_HOME/build-tools/35.0.0"
 TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 ABI="${ANDROID_ABI:-arm64-v8a}"

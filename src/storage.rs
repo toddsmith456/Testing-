@@ -16,6 +16,13 @@ pub struct QueuedPost {
     pub details: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedAccount {
+    pub pubkey: String,
+    pub npub: String,
+    pub relays: String,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -25,7 +32,7 @@ impl Store {
     }
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 3 {
+        if version > 4 {
             return Err(rusqlite::Error::InvalidQuery);
         }
         conn.execute_batch("PRAGMA foreign_keys=ON; BEGIN;
@@ -34,7 +41,33 @@ impl Store {
             CREATE TABLE IF NOT EXISTS bookmarks(account TEXT NOT NULL, event_id TEXT NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(account,event_id));
             CREATE TABLE IF NOT EXISTS outbox(account TEXT NOT NULL, event_id TEXT NOT NULL, event_json TEXT NOT NULL, status TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', PRIMARY KEY(account,event_id));
             CREATE TABLE IF NOT EXISTS profiles(account TEXT NOT NULL, author TEXT NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(account,author));
-            PRAGMA user_version=3; COMMIT;")?;
+            CREATE TABLE IF NOT EXISTS accounts(pubkey TEXT PRIMARY KEY, npub TEXT NOT NULL, relays TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS local_mutes(account TEXT NOT NULL, author TEXT NOT NULL, PRIMARY KEY(account,author));")?;
+        // Migrate the prior active account in the same transaction as the schema version.
+        if version < 4 {
+            let old_key: Option<String> = conn
+                .query_row("SELECT value FROM config WHERE key='account'", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let old_relays: Option<String> = conn
+                .query_row("SELECT value FROM config WHERE key='relays'", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if let (Some(raw), Some(relays)) = (old_key, old_relays) {
+                if let Ok(key) = PublicKey::parse(&raw) {
+                    if !raw.to_ascii_lowercase().starts_with("nsec") {
+                        let npub = key.to_bech32().map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        conn.execute(
+                            "INSERT OR IGNORE INTO accounts VALUES(?1,?2,?3)",
+                            params![key.to_hex(), npub, relays],
+                        )?;
+                    }
+                }
+            }
+        }
+        conn.execute_batch("PRAGMA user_version=4; COMMIT;")?;
         Ok(Self { conn })
     }
     pub fn read_config(&self) -> rusqlite::Result<Option<(String, String)>> {
@@ -63,6 +96,94 @@ impl Store {
             [relays],
         )?;
         t.commit()
+    }
+    pub fn list_accounts(&self) -> rusqlite::Result<Vec<SavedAccount>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pubkey,npub,relays FROM accounts ORDER BY pubkey")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SavedAccount {
+                pubkey: r.get(0)?,
+                npub: r.get(1)?,
+                relays: r.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+    /// Save public identifiers and select locally. The caller decides if/when to connect.
+    pub fn save_account(&mut self, key: PublicKey, relays: &str) -> rusqlite::Result<()> {
+        let npub = key.to_bech32().map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let t = self.conn.transaction()?;
+        t.execute(
+            "INSERT OR REPLACE INTO accounts(pubkey,npub,relays) VALUES(?1,?2,?3)",
+            params![key.to_hex(), npub, relays],
+        )?;
+        t.execute(
+            "INSERT OR REPLACE INTO config VALUES('account',?1)",
+            [&npub],
+        )?;
+        t.execute(
+            "INSERT OR REPLACE INTO config VALUES('relays',?1)",
+            [relays],
+        )?;
+        t.commit()
+    }
+    pub fn select_account(&mut self, pubkey: &str) -> rusqlite::Result<SavedAccount> {
+        let t = self.conn.transaction()?;
+        let account: SavedAccount = t.query_row(
+            "SELECT pubkey,npub,relays FROM accounts WHERE pubkey=?1",
+            [pubkey],
+            |r| {
+                Ok(SavedAccount {
+                    pubkey: r.get(0)?,
+                    npub: r.get(1)?,
+                    relays: r.get(2)?,
+                })
+            },
+        )?;
+        t.execute(
+            "INSERT OR REPLACE INTO config VALUES('account',?1)",
+            [&account.npub],
+        )?;
+        t.execute(
+            "INSERT OR REPLACE INTO config VALUES('relays',?1)",
+            [&account.relays],
+        )?;
+        t.commit()?;
+        Ok(account)
+    }
+    /// Local-only mute. This never creates or publishes a Nostr event.
+    pub fn set_local_mute(
+        &mut self,
+        account: &str,
+        author: &str,
+        muted: bool,
+    ) -> rusqlite::Result<()> {
+        let account = PublicKey::parse(account)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .to_hex();
+        let author = PublicKey::parse(author)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?
+            .to_hex();
+        if muted {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO local_mutes VALUES(?1,?2)",
+                params![account, author],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM local_mutes WHERE account=?1 AND author=?2",
+                params![account, author],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn local_mutes(&self, account: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT author FROM local_mutes WHERE account=?1 ORDER BY author")?;
+        let rows = stmt.query_map([account], |r| r.get(0))?;
+        rows.collect()
     }
     pub fn replace_feed(&mut self, account: &str, posts: &[Post]) -> rusqlite::Result<()> {
         // Keep older verified cache when a relay gives partial or empty results, bounded to 200.
@@ -338,7 +459,7 @@ mod tests {
             db.conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     }
     #[test]
@@ -346,5 +467,51 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "user_version", 99).unwrap();
         assert!(Store::init(conn).is_err());
+    }
+    #[test]
+    fn migrates_existing_active_account_and_preserves_relay_config() {
+        let conn = Connection::open_in_memory().unwrap();
+        let key = Keys::generate();
+        conn.execute_batch(
+            "CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL); PRAGMA user_version=3;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config VALUES('account',?1)",
+            [key.public_key().to_hex()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config VALUES('relays',?1)",
+            ["wss://private.example/path"],
+        )
+        .unwrap();
+        let db = Store::init(conn).unwrap();
+        let saved = db.list_accounts().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].pubkey, key.public_key().to_hex());
+        assert_eq!(saved[0].relays, "wss://private.example/path");
+        assert!(saved[0].npub.starts_with("npub1"));
+    }
+    #[test]
+    fn accounts_and_local_mutes_are_isolated_and_reversible() {
+        let mut db = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+        let author = Keys::generate().public_key();
+        db.save_account(a, "wss://a.example").unwrap();
+        db.save_account(b, "wss://b.example").unwrap();
+        assert_eq!(db.list_accounts().unwrap().len(), 2);
+        let selected = db.select_account(&a.to_hex()).unwrap();
+        assert_eq!(selected.relays, "wss://a.example");
+        assert_eq!(db.read_config().unwrap().unwrap().1, "wss://a.example");
+        db.set_local_mute(&a.to_hex(), &author.to_hex(), true)
+            .unwrap();
+        assert_eq!(db.local_mutes(&a.to_hex()).unwrap(), vec![author.to_hex()]);
+        assert!(db.local_mutes(&b.to_hex()).unwrap().is_empty());
+        db.set_local_mute(&a.to_hex(), &author.to_hex(), false)
+            .unwrap();
+        assert!(db.local_mutes(&a.to_hex()).unwrap().is_empty());
+        assert!(db.select_account("not-a-saved-account").is_err());
     }
 }

@@ -1,5 +1,6 @@
 pub mod core;
 pub mod publish;
+pub mod session;
 pub mod storage;
 pub mod ui;
 

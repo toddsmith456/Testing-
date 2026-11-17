@@ -1,7 +1,8 @@
 use crate::{
     core::{self, FeedResult, Post, Profile},
     publish::{self, PublishReport},
-    storage::{QueuedPost, Store},
+    session::DraftSessions,
+    storage::{QueuedPost, SavedAccount, Store},
 };
 use eframe::egui::{self, Color32, RichText, TextEdit};
 use std::{
@@ -25,6 +26,9 @@ pub struct NosturApp {
     public_key: String,
     relays: String,
     account: String,
+    accounts: Vec<SavedAccount>,
+    mutes: Vec<String>,
+    drafts: DraftSessions,
     tab: Tab,
     feed: Vec<Post>,
     bookmarks: Vec<Post>,
@@ -36,6 +40,7 @@ pub struct NosturApp {
     pending: Option<Receiver<Result<FeedResult, String>>>,
     store: Option<Store>,
     draft: String,
+    reply_target: Option<Post>,
     bunker_uri: String,
     outbox: Vec<QueuedPost>,
     pending_sign: Option<Receiver<Result<String, String>>>,
@@ -50,9 +55,18 @@ impl NosturApp {
                 .and_then(|_| Store::open(&p.join("nostur-public.sqlite3")).ok())
         });
         let config = store.as_ref().and_then(|s| s.read_config().ok().flatten());
-        let (public_key, relays) = config.unwrap_or_default();
+        let (raw_public_key, relays) = config.unwrap_or_default();
+        let public_key = core::public_npub(&raw_public_key).unwrap_or(raw_public_key);
         let account = core::parse_public_key(&public_key)
             .map(|p| p.to_hex())
+            .unwrap_or_default();
+        let accounts = store
+            .as_ref()
+            .and_then(|s| s.list_accounts().ok())
+            .unwrap_or_default();
+        let mutes = store
+            .as_ref()
+            .and_then(|s| s.local_mutes(&account).ok())
             .unwrap_or_default();
         let feed = store
             .as_ref()
@@ -86,6 +100,9 @@ impl NosturApp {
             public_key,
             relays,
             account,
+            accounts,
+            mutes,
+            drafts: DraftSessions::default(),
             tab,
             feed,
             bookmarks,
@@ -97,6 +114,7 @@ impl NosturApp {
             pending: None,
             store,
             draft: String::new(),
+            reply_target: None,
             bunker_uri: String::new(),
             outbox,
             pending_sign: None,
@@ -114,9 +132,10 @@ impl NosturApp {
             .unwrap_or_default();
     }
     fn active_key(&self) -> Result<nostr_sdk::prelude::PublicKey, String> {
-        let key = core::parse_public_key(&self.public_key).map_err(|e| e.to_string())?;
+        let key = core::parse_user_npub(&self.public_key)
+            .map_err(|_| "Enter a valid npub public key (not a private key).".to_string())?;
         if key.to_hex() != self.account {
-            return Err("Save and connect this account before composing or publishing.".into());
+            return Err("Save this account before composing or publishing.".into());
         }
         Ok(key)
     }
@@ -139,12 +158,18 @@ impl NosturApp {
             self.state = e.to_string();
             return;
         }
-        if let Err(e) = publish::build_note(key, &self.draft) {
-            self.state = e.to_string();
-            return;
-        }
+        let expected = match publish::prepare_note(
+            key,
+            &self.draft,
+            self.reply_target.as_ref().map(|p| p.event_json.as_str()),
+        ) {
+            Ok(event) => event,
+            Err(e) => {
+                self.state = e.to_string();
+                return;
+            }
+        };
         let uri = self.bunker_uri.clone();
-        let content = self.draft.clone();
         let (tx, rx) = mpsc::channel();
         self.pending_sign = Some(rx);
         self.state = "Waiting for the remote signer. The post has not been published.".into();
@@ -155,7 +180,7 @@ impl NosturApp {
                 .build()
                 .map_err(|_| "Could not start signer worker".to_string())
                 .and_then(|rt| {
-                    rt.block_on(publish::sign_remote(&uri, key, &content))
+                    rt.block_on(publish::sign_expected(&uri, expected))
                         .map_err(|e| e.to_string())
                 });
             let _ = tx.send(result);
@@ -229,6 +254,7 @@ impl NosturApp {
                                 match store.enqueue_signed(&self.account, &json) {
                                     Ok(_) => {
                                         self.draft.clear();
+                                        self.reply_target = None;
                                         self.state =
                                             "Signed and queued locally. Not published yet.".into();
                                     }
@@ -305,14 +331,124 @@ impl NosturApp {
             }
         }
     }
-    fn refresh(&mut self, ctx: &egui::Context) {
-        let key = match core::parse_public_key(&self.public_key) {
-            Ok(v) => v,
-            Err(e) => {
-                self.state = e.to_string();
-                return;
-            }
+    /// Apply a previously saved identity only when no async action is in flight.
+    fn apply_account(&mut self, account: SavedAccount) {
+        self.drafts.switch(
+            &self.account,
+            &account.pubkey,
+            &mut self.draft,
+            &mut self.reply_target,
+        );
+        if self.account != account.pubkey {
+            self.bunker_uri.clear();
+        }
+        self.account = account.pubkey;
+        self.public_key = account.npub;
+        self.relays = account.relays;
+        self.feed = self
+            .store
+            .as_ref()
+            .and_then(|s| s.cached_feed(&self.account).ok())
+            .unwrap_or_default();
+        self.bookmarks = self
+            .store
+            .as_ref()
+            .and_then(|s| s.bookmarks(&self.account).ok())
+            .unwrap_or_default();
+        self.profiles = self
+            .store
+            .as_ref()
+            .and_then(|s| s.profiles(&self.account).ok())
+            .unwrap_or_default();
+        self.mutes = self
+            .store
+            .as_ref()
+            .and_then(|s| s.local_mutes(&self.account).ok())
+            .unwrap_or_default();
+        self.accounts = self
+            .store
+            .as_ref()
+            .and_then(|s| s.list_accounts().ok())
+            .unwrap_or_default();
+        self.selected_post = None;
+        self.selected_author.clear();
+        self.search.clear();
+        self.reload_outbox();
+    }
+    fn save_current_account(&mut self) -> Result<nostr_sdk::prelude::PublicKey, String> {
+        if self.busy() {
+            return Err("Wait for the current operation before switching accounts.".into());
+        }
+        let key = core::parse_user_npub(&self.public_key).map_err(|_| {
+            "Enter a valid npub public key. Raw hex and private keys are not accepted.".to_string()
+        })?;
+        let relays = if self.relays.trim().is_empty() {
+            String::new()
+        } else {
+            core::parse_relays(&self.relays)
+                .map_err(|e| e.to_string())?
+                .join("\n")
         };
+        let store = self
+            .store
+            .as_mut()
+            .ok_or("Local database unavailable; cannot save account.")?;
+        store
+            .save_account(key, &relays)
+            .map_err(|e| format!("Could not save account: {e}"))?;
+        let account = store
+            .select_account(&key.to_hex())
+            .map_err(|e| format!("Could not select account: {e}"))?;
+        self.apply_account(account);
+        Ok(key)
+    }
+    fn switch_saved_account(&mut self, key: &str) {
+        if self.busy() {
+            self.state = "Wait for the current operation before switching accounts.".into();
+            return;
+        }
+        let result = self
+            .store
+            .as_mut()
+            .ok_or("Local database unavailable.".to_string())
+            .and_then(|s| {
+                s.select_account(key)
+                    .map_err(|e| format!("Could not select account: {e}"))
+            });
+        match result {
+            Ok(account) => {
+                self.apply_account(account);
+                self.state = "Account switched locally; no network connection was made.".into();
+            }
+            Err(e) => self.state = e,
+        }
+    }
+    fn set_mute(&mut self, author: &str, enabled: bool) {
+        if self.account.is_empty() {
+            self.state = "Select a saved account first.".into();
+            return;
+        }
+        let Some(store) = &mut self.store else {
+            self.state = "Local database unavailable.".into();
+            return;
+        };
+        match store.set_local_mute(&self.account, author, enabled) {
+            Ok(()) => {
+                self.mutes = store.local_mutes(&self.account).unwrap_or_default();
+                self.state = if enabled {
+                    "Author muted locally for this account; nothing was published."
+                } else {
+                    "Local mute removed; nothing was published."
+                }
+                .into();
+            }
+            Err(e) => self.state = format!("Could not update local mute: {e}"),
+        }
+    }
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
         let relays = match core::parse_relays(&self.relays) {
             Ok(v) => v,
             Err(e) => {
@@ -320,25 +456,13 @@ impl NosturApp {
                 return;
             }
         };
-        let next = key.to_hex();
-        if self.account != next {
-            self.feed.clear();
-            self.bookmarks.clear();
-            self.profiles.clear();
-        }
-        self.account = next;
-        self.reload_outbox();
-        if let Some(s) = &mut self.store {
-            if let Err(e) = s.save_config(&self.public_key, &relays.join("\n")) {
-                self.state = format!("Could not save settings: {e}");
+        let key = match self.save_current_account() {
+            Ok(k) => k,
+            Err(e) => {
+                self.state = e;
                 return;
             }
-            self.bookmarks = s.bookmarks(&self.account).unwrap_or_default();
-            self.profiles = s.profiles(&self.account).unwrap_or_default();
-            if self.feed.is_empty() {
-                self.feed = s.cached_feed(&self.account).unwrap_or_default();
-            }
-        }
+        };
         self.state = "Connecting only to your selected relays…".into();
         self.tab = Tab::Following;
         let (tx, rx) = mpsc::channel();
@@ -469,8 +593,9 @@ impl eframe::App for NosturApp {
                 .size(12.),
         );
         if self.tab == Tab::Settings {
+            egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui, |ui| {
             ui.add_space(8.);
-            ui.label("Public key (npub or hex). Never enter a private key.");
+            ui.label("Public key (npub only). Never enter a private key.");
             if ui
                 .add_enabled(
                     !busy,
@@ -483,7 +608,7 @@ impl eframe::App for NosturApp {
                 self.feed.clear();
                 self.bookmarks.clear();
                 self.profiles.clear();
-                self.state = "Account changed; connect to load its feed.".into();
+                self.state = "Account input edited. Save it before posting or switching.".into();
             }
             ui.add_space(8.);
             ui.label("Secure relay URLs, one per line");
@@ -502,19 +627,65 @@ impl eframe::App for NosturApp {
             }
             ui.add_space(5.);
             ui.small("No automatic connections or default relays. Selected relays can see your IP, public key and requests. Images and links are not loaded.");
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy,egui::Button::new("Save account (offline)")).clicked(){
+                    match self.save_current_account(){Ok(_)=>self.state="Account saved locally; no network connection was made.".into(),Err(e)=>self.state=e}
+                }
+            });
             if ui
                 .add_enabled(!busy, egui::Button::new("Save and connect"))
                 .clicked()
             {
                 self.refresh(&ctx);
             }
+            ui.add_space(8.);ui.heading("Saved accounts");
+            ui.small("Switching is local and does not connect. Unsigned drafts are kept per account in memory only; signer URIs are cleared when switching.");
+            let accounts=self.accounts.clone();let mut selected=None;
+            for account in &accounts {ui.horizontal(|ui|{
+                let label=format!("{}…{}",&account.npub[..12.min(account.npub.len())],if account.pubkey==self.account {" (active)"}else{""});
+                ui.label(label);
+                if ui.add_enabled(!busy,egui::Button::new(if account.pubkey==self.account {"Restore"}else{"Switch"})).clicked(){selected=Some(account.pubkey.clone());}
+            });}
+            if let Some(key)=selected{self.switch_saved_account(&key);}
+            ui.separator();ui.heading("Local mutes");
+            ui.small("Muted authors are hidden from Following and Search for the active account only. Bookmarks and profile views remain visible. Nothing is published or synced.");
+            let mutes=self.mutes.clone();let mut unmute=None;
+            if mutes.is_empty(){ui.small("No locally muted authors for this account.");}
+            for author in &mutes {ui.horizontal(|ui|{ui.small(&author[..12.min(author.len())]);if ui.button("Unmute").clicked(){unmute=Some(author.clone());}});}
+            if let Some(author)=unmute{self.set_mute(&author,false);}
             ui.add_space(8.);
             ui.small("Development build. NIP-46 signing is experimental; DMs, payments and media are not implemented.");
+            });
             return;
         }
         if self.tab == Tab::Compose {
+            egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui, |ui| {
             ui.add_space(6.);
-            ui.label(RichText::new("Public post").strong());
+            ui.label(
+                RichText::new(if self.reply_target.is_some() {
+                    "Public reply"
+                } else {
+                    "Public post"
+                })
+                .strong(),
+            );
+            if let Some(target) = &self.reply_target {
+                ui.small(format!(
+                    "Replying to {} · event {}",
+                    &target.author[..12.min(target.author.len())],
+                    &target.id[..12.min(target.id.len())]
+                ));
+                ui.label(&target.content);
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new("Cancel reply (keep text as new post)"),
+                    )
+                    .clicked()
+                {
+                    self.reply_target = None;
+                }
+            }
             ui.small(format!(
                 "Selected account: {}",
                 if self.account.is_empty() {
@@ -572,15 +743,27 @@ impl eframe::App for NosturApp {
             ));
             let items = self.outbox.clone();
             let mut action = None;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            {
                     if items.is_empty() {
                         ui.label("No signed events for this account.");
                     }
                     for item in &items {
                         if let Ok(key) = self.active_key() {
                             if let Ok(event) = publish::checked_event(key, &item.event_json) {
+                                let refs: Vec<_> = event
+                                    .tags
+                                    .iter()
+                                    .filter(|t| {
+                                        t.as_slice().first().map(String::as_str) == Some("e")
+                                    })
+                                    .map(|t| t.as_slice().get(1).cloned().unwrap_or_default())
+                                    .collect();
+                                if !refs.is_empty() {
+                                    ui.small(format!(
+                                        "Public reply references: {}",
+                                        refs.join(", ")
+                                    ));
+                                }
                                 ui.label(event.content);
                             }
                         }
@@ -608,7 +791,7 @@ impl eframe::App for NosturApp {
                         });
                         ui.separator();
                     }
-                });
+            }
             if let Some((send, item)) = action {
                 if send {
                     self.start_publish(&ctx, item);
@@ -622,6 +805,7 @@ impl eframe::App for NosturApp {
                     self.reload_outbox();
                 }
             }
+            });
             return;
         }
         if self.tab == Tab::PostDetail {
@@ -636,7 +820,19 @@ impl eframe::App for NosturApp {
                 ui.small(format!("Author: {}", post.author));
                 ui.small(format!("Event ID: {}", post.id));
                 ui.small(format!("Published: {}", relative_time(post.created_at)));
-                ui.small("Replies and reactions are not yet implemented.");
+                ui.small("Thread fetching and reactions are not implemented. Replies are public and signed using the same experimental signer flow.");
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Reply publicly"))
+                    .clicked()
+                {
+                    if !self.draft.is_empty() || self.reply_target.is_some() {
+                        self.state =
+                            "Finish or clear your existing draft before starting a reply.".into();
+                    } else {
+                        self.reply_target = Some(post.clone());
+                        self.tab = Tab::Compose;
+                    }
+                }
             }
             return;
         }
@@ -662,6 +858,19 @@ impl eframe::App for NosturApp {
                 ui.small("Profile metadata not available in cache.");
             }
             ui.small(&self.selected_author);
+            let author = self.selected_author.clone();
+            let muted = self.mutes.contains(&author);
+            if ui
+                .button(if muted {
+                    "Unmute locally"
+                } else {
+                    "Mute locally"
+                })
+                .clicked()
+            {
+                self.set_mute(&author, !muted);
+            }
+            ui.small("Local mute affects this account's Following and Search only; it does not publish a block or delete posts.");
             ui.separator();
             ui.label("Cached posts");
         }
@@ -688,6 +897,11 @@ impl eframe::App for NosturApp {
             .show(ui, |ui| {
                 let mut count = 0;
                 for post in &posts {
+                    if (self.tab == Tab::Following || self.tab == Tab::Search)
+                        && self.mutes.contains(&post.author)
+                    {
+                        continue;
+                    }
                     if self.tab == Tab::Profile && post.author != self.selected_author {
                         continue;
                     }
@@ -770,5 +984,66 @@ fn relative_time(timestamp: u64) -> String {
         format!("{}h", elapsed / 3600)
     } else {
         format!("{}d", elapsed / 86400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::prelude::*;
+    #[test]
+    fn account_switch_clears_context_preserves_account_drafts_and_blocks_when_busy() {
+        let path = std::env::temp_dir().join(format!(
+            "nostur-ui-test-{}.sqlite",
+            Keys::generate().public_key().to_hex()
+        ));
+        let mut store = Store::open(&path).unwrap();
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+        store.save_account(a, "wss://a.example").unwrap();
+        store.save_account(b, "wss://b.example").unwrap();
+        store.select_account(&a.to_hex()).unwrap();
+        let mut app = NosturApp {
+            public_key: a.to_bech32().unwrap(),
+            relays: "wss://a.example".into(),
+            account: a.to_hex(),
+            accounts: vec![],
+            mutes: vec![],
+            drafts: DraftSessions::default(),
+            tab: Tab::Compose,
+            feed: vec![],
+            bookmarks: vec![],
+            profiles: vec![],
+            selected_author: "old author".into(),
+            selected_post: None,
+            search: "old search".into(),
+            state: String::new(),
+            pending: None,
+            store: Some(store),
+            draft: "account a draft".into(),
+            reply_target: None,
+            bunker_uri: "secret".into(),
+            outbox: vec![],
+            pending_sign: None,
+            pending_send: None,
+        };
+        let (_tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.switch_saved_account(&b.to_hex());
+        assert_eq!(app.account, a.to_hex());
+        app.pending = None;
+        app.switch_saved_account(&b.to_hex());
+        assert_eq!(app.account, b.to_hex());
+        assert_eq!(app.relays, "wss://b.example");
+        assert!(app.bunker_uri.is_empty());
+        assert!(app.draft.is_empty());
+        assert!(app.search.is_empty());
+        assert!(app.selected_author.is_empty());
+        app.draft = "account b draft".into();
+        app.switch_saved_account(&a.to_hex());
+        assert_eq!(app.draft, "account a draft");
+        assert_eq!(app.relays, "wss://a.example");
+        drop(app);
+        std::fs::remove_file(path).unwrap();
     }
 }

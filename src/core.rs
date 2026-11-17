@@ -96,6 +96,19 @@ pub fn parse_public_key(value: &str) -> Result<PublicKey, FeedError> {
     PublicKey::parse(value).map_err(|_| FeedError::InvalidPublicKey)
 }
 
+/// User-facing entry only accepts npub, so raw secret-key hex cannot be saved as an identifier.
+pub fn parse_user_npub(value: &str) -> Result<PublicKey, FeedError> {
+    if !value.trim().to_ascii_lowercase().starts_with("npub1") {
+        return Err(FeedError::InvalidPublicKey);
+    }
+    parse_public_key(value)
+}
+pub fn public_npub(value: &str) -> Result<String, FeedError> {
+    parse_public_key(value)?
+        .to_bech32()
+        .map_err(|_| FeedError::InvalidPublicKey)
+}
+
 pub fn parse_relays(text: &str) -> Result<Vec<String>, FeedError> {
     let mut urls = BTreeSet::new();
     for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
@@ -316,6 +329,15 @@ mod tests {
             parse_public_key("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
                 .is_ok()
         );
+    }
+    #[test]
+    fn user_entry_rejects_hex_and_nsec_even_if_valid() {
+        let key = Keys::generate();
+        let npub = key.public_key().to_bech32().unwrap();
+        assert_eq!(parse_user_npub(&npub).unwrap(), key.public_key());
+        assert!(parse_user_npub(&key.public_key().to_hex()).is_err());
+        assert!(parse_user_npub(&key.secret_key().to_secret_hex()).is_err());
+        assert!(parse_user_npub(&key.secret_key().to_bech32().unwrap()).is_err());
     }
     #[test]
     fn post_round_trips_without_secret_material() {

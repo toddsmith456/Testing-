@@ -7,7 +7,8 @@ This repository is a **work in progress**, not a completed Nostur clone. It is a
 - A Rust-rendered Following view using egui/eframe, with an Android `NativeActivity` entry point and desktop development target.
 - Explicit user-selected `wss://` relays; no app connection at startup. Fetches a signed NIP-02 follow list and signed kind-1 notes; results can be partial.
 - Local SQLite storage for public account ID, chosen relay URLs, cached signed public posts and per-account local bookmarks. Cached events and profile metadata are signature-checked again on read. Local search scans the current cached feed; it does not query a search service.
-- Relay selection and public key remain on device; public posting uses an experimental NIP-46 remote signer and a durable signed-event outbox; there is no private-key entry. **Do not enter your private key**, even as hexadecimal: a private key's raw hex can be indistinguishable from a public key by syntax.
+- Multiple public accounts can be saved and switched offline, with separate relays, caches, bookmarks, outbox, local mutes and in-memory drafts. New account entry accepts **npub only**, not hex or private keys. **Never enter a private key.**
+- Public notes and replies use an experimental NIP-46 remote signer and a durable signed-event outbox. Drafts and signer URIs are memory-only; switching accounts clears the signer URI and does not connect.
 - It does not intentionally include ads, analytics, crash collection, Google push or external media loading. **This is not an independent security, dependency, or network audit.** Relay operators see the connecting IP address, selected public key and subscription filters. Operating system, network provider and compromised-device threats are outside its control.
 
 ## Important limitations
@@ -46,4 +47,12 @@ For a local x86_64 Android emulator development build, set `ANDROID_ABI=x86_64`;
 
 ### Experimental public posting
 
+To create a public reply, open a cached post and tap **Reply publicly**. The composer displays the parent; it preserves marked or legacy NIP-10 thread roots and participants when possible, and refuses ambiguous reply-only threads. Thread fetching and reactions are not implemented. Replies, like notes, require signing and an explicit separate publish step.
+
 In **New post**, enter the note and a `bunker://` URI from a compatible remote signer. The app displays the signer's relay destinations; **Request signature** does not publish. After approval, the verified signed event is stored in the local outbox. **Publish / retry** sends that same event to the selected relays; it reports acknowledgements and unconfirmed destinations. An interrupted send may already have reached a relay, and removing an outbox entry does not delete a public event. No automatic retry is performed. The bunker URI, its connection secret, and the ephemeral signer client key are not stored in the database. Do not use the experimental signing path with important accounts until it has been audited and tested with real signers and devices.
+
+### Local account controls
+
+Settings saves or switches public accounts without contacting relays. Select **Save and connect** or **Refresh** to connect explicitly. To mute someone locally, open their profile and tap **Mute locally**; Settings lists muted authors and provides **Unmute**. Mutes apply to Following and Search for the active account only; bookmarked posts and profile views remain accessible. Mutes are not synced or published and do not stop a relay delivering those events. Drafts and reply targets are isolated per account for this app session and disappear when the app closes. Saved public accounts, relay choices, mute lists and the public-event database are not encrypted.
+
+A `v*-dev.*` tag runs a GitHub Actions workflow that attempts to publish a **prerelease**, not a production release, after host tests and an ARM64 debug APK build succeed. The workflow generates an ephemeral debug signing key on each run; later builds will not reliably update in place, and uninstalling may erase local data. Publishing also requires Actions `contents: write` permission in the repository settings. Do not treat a prerelease as proof of device or signer interoperability.
